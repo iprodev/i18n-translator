@@ -243,19 +243,26 @@ def translate_json_file(input_path: str, output_path: str, source_lang: str,
 def batch_translate(input_dir: str, output_dir: str, source_lang: str, 
                     target_langs: list[str], model: str, state: TranslationState,
                     style: str = "friendly", force_restart: bool = False):
-    """Translate all JSON files in a directory to multiple target languages."""
+    """Translate all JSON files in a directory (including subdirectories) to multiple target languages."""
     input_path = Path(input_dir)
-    json_files = list(input_path.glob("*.json"))
+    
+    # Recursive search for all JSON files
+    json_files = list(input_path.rglob("*.json"))
     
     if not json_files:
         print(f"No JSON files found in {input_dir}")
         return
     
     print(f"Found {len(json_files)} JSON file(s)")
+    for f in json_files:
+        print(f"  - {f.relative_to(input_path)}")
     
     for json_file in json_files:
+        # Preserve subdirectory structure
+        relative_path = json_file.relative_to(input_path)
+        
         for target_lang in target_langs:
-            output_file = Path(output_dir) / target_lang / json_file.name
+            output_file = Path(output_dir) / target_lang / relative_path
             translate_json_file(str(json_file), str(output_file), source_lang, 
                               target_lang, model, state, style, force_restart)
 
