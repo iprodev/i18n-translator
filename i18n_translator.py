@@ -1,50 +1,126 @@
 #!/usr/bin/env python3
 """
-i18n JSON Translator using LM Studio API
-Translates JSON language files to target languages using a local LLM.
-Features: Resume capability, nested structure support, placeholder preservation.
+i18n Translator - Multi-format translation tool using LM Studio API
+Supports: JSON, YAML, PO/POT, CSV, Android XML, iOS Strings
+Features: Batch processing, parallel translation, smart caching, resume capability
 """
 
 import json
 import argparse
 import time
 import hashlib
+import re
+import csv
+import signal
+import sys
 from pathlib import Path
 from typing import Any
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
-# LM Studio API Configuration
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    global shutdown_requested
+    shutdown_requested = True
+    print("\n\n⚠️ Shutdown requested, finishing current batch...")
+
+signal.signal(signal.SIGINT, signal_handler)
+if sys.platform != 'win32':
+    signal.signal(signal.SIGTERM, signal_handler)
+
+# Optional imports with fallbacks
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+    from rich.console import Console
+    from rich.table import Table
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# Configuration
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+DEFAULT_BATCH_SIZE = 5
+DEFAULT_WORKERS = 3
 
 # Translation style presets
 TRANSLATION_STYLES = {
     "formal": {
         "name": "Formal",
-        "prompt": "Use formal, professional language. Use polite pronouns (شما in Persian, Sie in German, etc.).",
-        "example": "Formal business tone"
+        "prompt": "Use formal, professional language. Use polite pronouns (Sie in German, vous in French, etc.).",
     },
     "friendly": {
-        "name": "Friendly",
-        "prompt": "Use warm, friendly, conversational language. Use informal pronouns (تو in Persian, du in German, etc.). Sound natural like talking to a friend, not robotic or stiff.",
-        "example": "Casual friendly tone"
+        "name": "Friendly", 
+        "prompt": "Use warm, friendly, conversational language. Use informal pronouns (du in German, tu in French, etc.). Sound natural like talking to a friend.",
     },
     "casual": {
         "name": "Casual",
-        "prompt": "Use very casual, everyday spoken language. Use colloquial expressions and informal grammar where natural. Like texting a close friend.",
-        "example": "Very informal, colloquial"
+        "prompt": "Use very casual, everyday spoken language. Use colloquial expressions and informal grammar.",
     },
     "playful": {
         "name": "Playful",
-        "prompt": "Use fun, playful, energetic language. Add personality and warmth. Great for apps targeting young users.",
-        "example": "Fun and energetic"
+        "prompt": "Use fun, playful, energetic language. Add personality and warmth.",
     },
     "neutral": {
         "name": "Neutral",
-        "prompt": "Use clear, neutral language. Avoid being too formal or too casual. Balanced and accessible.",
-        "example": "Balanced, clear"
+        "prompt": "Use clear, neutral language. Balanced and accessible.",
     }
 }
 
+console = Console() if RICH_AVAILABLE else None
+
+# ============== Smart Cache ==============
+class TranslationCache:
+    """Smart cache for repeated translations."""
+    
+    def __init__(self, cache_file: str = ".translation_cache.json"):
+        self.cache_file = Path(cache_file)
+        self.cache = self._load_cache()
+        self.hits = 0
+        self.misses = 0
+    
+    def _load_cache(self) -> dict:
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save(self):
+        with open(self.cache_file, 'w', encoding='utf-8') as f:
+            json.dump(self.cache, f, ensure_ascii=False, indent=2)
+    
+    def _make_key(self, text: str, source: str, target: str, style: str) -> str:
+        return hashlib.md5(f"{text}:{source}:{target}:{style}".encode()).hexdigest()
+    
+    def get(self, text: str, source: str, target: str, style: str) -> str | None:
+        key = self._make_key(text, source, target, style)
+        result = self.cache.get(key)
+        if result:
+            self.hits += 1
+        else:
+            self.misses += 1
+        return result
+    
+    def set(self, text: str, source: str, target: str, style: str, translation: str):
+        key = self._make_key(text, source, target, style)
+        self.cache[key] = translation
+    
+    def get_stats(self) -> tuple[int, int]:
+        return self.hits, self.misses
+
+
+# ============== State Management ==============
 class TranslationState:
     """Manages translation progress and resume capability."""
     
@@ -54,8 +130,15 @@ class TranslationState:
     
     def _load_state(self) -> dict:
         if self.state_file.exists():
-            with open(self.state_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            try:
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if not content:
+                        return {"completed": {}, "partial": {}}
+                    return json.loads(content)
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"⚠ State file issue, starting fresh: {e}")
+                return {"completed": {}, "partial": {}}
         return {"completed": {}, "partial": {}}
     
     def save(self):
@@ -70,13 +153,13 @@ class TranslationState:
         return key_path in self.state["completed"].get(job_id, {})
     
     def get_translated(self, job_id: str, key_path: str) -> str | None:
-        return self.state["completed"].get(job_id, {}).get(key_path)
+        data = self.state["completed"].get(job_id, {}).get(key_path)
+        return data.get("translated") if data else None
     
     def mark_done(self, job_id: str, key_path: str, original: str, translated: str):
         if job_id not in self.state["completed"]:
             self.state["completed"][job_id] = {}
         self.state["completed"][job_id][key_path] = {"original": original, "translated": translated}
-        self.save()
     
     def get_progress(self, job_id: str) -> int:
         return len(self.state["completed"].get(job_id, {}))
@@ -86,279 +169,657 @@ class TranslationState:
             del self.state["completed"][job_id]
             self.save()
 
-def translate_text(text: str, source_lang: str, target_lang: str, model: str = "local-model", style: str = "friendly") -> str:
-    """Translate a single text string using LM Studio API."""
-    if not text or not text.strip():
-        return text
-    
-    style_info = TRANSLATION_STYLES.get(style, TRANSLATION_STYLES["friendly"])
-    style_instruction = style_info["prompt"]
-    
-    prompt = f"""Translate the following text from {source_lang} to {target_lang}.
 
-Style: {style_instruction}
+# ============== File Format Handlers ==============
+class FileHandler(ABC):
+    """Abstract base class for file format handlers."""
+    
+    @abstractmethod
+    def load(self, path: str) -> dict[str, str]:
+        """Load file and return flat dict of key -> text."""
+        pass
+    
+    @abstractmethod
+    def save(self, path: str, data: dict[str, str], original_data: Any = None):
+        """Save translated data to file."""
+        pass
+    
+    @staticmethod
+    def get_handler(path: str) -> 'FileHandler':
+        """Get appropriate handler for file type."""
+        ext = Path(path).suffix.lower()
+        handlers = {
+            '.json': JsonHandler(),
+            '.yaml': YamlHandler(),
+            '.yml': YamlHandler(),
+            '.po': PoHandler(),
+            '.pot': PoHandler(),
+            '.csv': CsvHandler(),
+            '.xml': AndroidXmlHandler(),
+            '.strings': IosStringsHandler(),
+        }
+        if ext not in handlers:
+            raise ValueError(f"Unsupported file format: {ext}")
+        if ext in ['.yaml', '.yml'] and not YAML_AVAILABLE:
+            raise ImportError("PyYAML required: pip install pyyaml")
+        return handlers[ext]
+
+
+class JsonHandler(FileHandler):
+    """Handler for JSON i18n files."""
+    
+    def _flatten(self, data: Any, prefix: str = "") -> dict[str, str]:
+        result = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                new_key = f"{prefix}.{k}" if prefix else k
+                result.update(self._flatten(v, new_key))
+        elif isinstance(data, list):
+            for i, v in enumerate(data):
+                new_key = f"{prefix}[{i}]"
+                result.update(self._flatten(v, new_key))
+        elif isinstance(data, str) and data.strip():
+            result[prefix] = data
+        return result
+    
+    def _unflatten(self, flat: dict[str, str], original: Any) -> Any:
+        if isinstance(original, dict):
+            result = {}
+            for k, v in original.items():
+                prefix = k
+                if isinstance(v, str):
+                    result[k] = flat.get(prefix, v)
+                else:
+                    nested_flat = {key[len(prefix)+1:]: val for key, val in flat.items() if key.startswith(prefix + ".") or key.startswith(prefix + "[")}
+                    result[k] = self._unflatten(nested_flat, v)
+            return result
+        elif isinstance(original, list):
+            result = []
+            for i, v in enumerate(original):
+                prefix = f"[{i}]"
+                if isinstance(v, str):
+                    result.append(flat.get(prefix.lstrip("."), v))
+                else:
+                    nested_flat = {key[len(str(i))+2:]: val for key, val in flat.items() if key.startswith(f"[{i}]")}
+                    result.append(self._unflatten(nested_flat, v))
+            return result
+        elif isinstance(original, str):
+            return flat.get("", original)
+        return original
+    
+    def load(self, path: str) -> tuple[dict[str, str], Any]:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return self._flatten(data), data
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: Any = None):
+        if original_data is not None:
+            data = self._unflatten_full(flat_data, original_data)
+        else:
+            data = flat_data
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    def _unflatten_full(self, flat: dict[str, str], original: Any, prefix: str = "") -> Any:
+        if isinstance(original, dict):
+            result = {}
+            for k, v in original.items():
+                new_prefix = f"{prefix}.{k}" if prefix else k
+                result[k] = self._unflatten_full(flat, v, new_prefix)
+            return result
+        elif isinstance(original, list):
+            result = []
+            for i, v in enumerate(original):
+                new_prefix = f"{prefix}[{i}]"
+                result.append(self._unflatten_full(flat, v, new_prefix))
+            return result
+        elif isinstance(original, str):
+            return flat.get(prefix, original)
+        return original
+
+
+class YamlHandler(FileHandler):
+    """Handler for YAML i18n files."""
+    
+    def __init__(self):
+        self.json_handler = JsonHandler()
+    
+    def load(self, path: str) -> tuple[dict[str, str], Any]:
+        if not YAML_AVAILABLE:
+            raise ImportError("PyYAML required: pip install pyyaml")
+        with open(path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        return self.json_handler._flatten(data), data
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: Any = None):
+        if not YAML_AVAILABLE:
+            raise ImportError("PyYAML required: pip install pyyaml")
+        if original_data is not None:
+            data = self.json_handler._unflatten_full(flat_data, original_data)
+        else:
+            data = flat_data
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+
+
+class PoHandler(FileHandler):
+    """Handler for PO/POT gettext files."""
+    
+    def load(self, path: str) -> tuple[dict[str, str], list]:
+        entries = []
+        flat = {}
+        current = {"msgid": "", "msgstr": "", "comments": []}
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            line = line.rstrip('\n')
+            if line.startswith('#'):
+                current["comments"].append(line)
+            elif line.startswith('msgid '):
+                if current["msgid"]:
+                    entries.append(current.copy())
+                    if current["msgid"].strip('"'):
+                        flat[current["msgid"].strip('"')] = current["msgstr"].strip('"')
+                current = {"msgid": line[6:], "msgstr": "", "comments": current["comments"] if not current["msgid"] else []}
+            elif line.startswith('msgstr '):
+                current["msgstr"] = line[7:]
+            elif line.startswith('"') and current["msgstr"]:
+                current["msgstr"] += line
+            elif line.startswith('"') and current["msgid"]:
+                current["msgid"] += line
+        
+        if current["msgid"]:
+            entries.append(current)
+            if current["msgid"].strip('"'):
+                flat[current["msgid"].strip('"')] = current["msgstr"].strip('"')
+        
+        return flat, entries
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: list = None):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            for entry in (original_data or []):
+                for comment in entry.get("comments", []):
+                    f.write(comment + '\n')
+                msgid = entry["msgid"].strip('"')
+                msgstr = flat_data.get(msgid, "")
+                f.write(f'msgid "{msgid}"\n')
+                f.write(f'msgstr "{msgstr}"\n\n')
+
+
+class CsvHandler(FileHandler):
+    """Handler for CSV files (key, source, translation)."""
+    
+    def load(self, path: str) -> tuple[dict[str, str], list]:
+        flat = {}
+        rows = []
+        with open(path, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+                key = row.get('key', row.get('id', ''))
+                text = row.get('source', row.get('text', row.get('en', '')))
+                if key and text:
+                    flat[key] = text
+        return flat, rows
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: list = None):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['key', 'source', 'translation'])
+            for key, translation in flat_data.items():
+                source = ""
+                if original_data:
+                    for row in original_data:
+                        if row.get('key', row.get('id', '')) == key:
+                            source = row.get('source', row.get('text', row.get('en', '')))
+                            break
+                writer.writerow([key, source, translation])
+
+
+class AndroidXmlHandler(FileHandler):
+    """Handler for Android strings.xml files."""
+    
+    def load(self, path: str) -> tuple[dict[str, str], str]:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        flat = {}
+        pattern = r'<string\s+name="([^"]+)"[^>]*>([^<]*)</string>'
+        for match in re.finditer(pattern, content):
+            name, value = match.groups()
+            flat[name] = value
+        
+        return flat, content
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: str = None):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        
+        if original_data:
+            content = original_data
+            for name, translation in flat_data.items():
+                pattern = rf'(<string\s+name="{re.escape(name)}"[^>]*>)[^<]*(</string>)'
+                content = re.sub(pattern, rf'\1{translation}\2', content)
+        else:
+            lines = ['<?xml version="1.0" encoding="utf-8"?>', '<resources>']
+            for name, value in flat_data.items():
+                lines.append(f'    <string name="{name}">{value}</string>')
+            lines.append('</resources>')
+            content = '\n'.join(lines)
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+
+class IosStringsHandler(FileHandler):
+    """Handler for iOS .strings files."""
+    
+    def load(self, path: str) -> tuple[dict[str, str], str]:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        flat = {}
+        pattern = r'"([^"]+)"\s*=\s*"([^"]+)"\s*;'
+        for match in re.finditer(pattern, content):
+            key, value = match.groups()
+            flat[key] = value
+        
+        return flat, content
+    
+    def save(self, path: str, flat_data: dict[str, str], original_data: str = None):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        
+        lines = []
+        for key, value in flat_data.items():
+            escaped_value = value.replace('"', '\\"')
+            lines.append(f'"{key}" = "{escaped_value}";')
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+
+# ============== Translation Engine ==============
+class TranslationEngine:
+    """Handles translation with batching and parallel processing."""
+    
+    def __init__(self, url: str, model: str, style: str, source_lang: str, target_lang: str,
+                 cache: TranslationCache, batch_size: int = 5, max_workers: int = 3):
+        self.url = url
+        self.model = model
+        self.style = style
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.cache = cache
+        self.batch_size = batch_size
+        self.max_workers = max_workers
+        self.style_prompt = TRANSLATION_STYLES.get(style, TRANSLATION_STYLES["friendly"])["prompt"]
+    
+    def _build_batch_prompt(self, items: list[tuple[str, str]]) -> str:
+        """Build prompt for batch translation."""
+        texts = "\n".join([f"[{i}] {text}" for i, (key, text) in enumerate(items)])
+        return f"""Translate the following texts from {self.source_lang} to {self.target_lang}.
+
+Style: {self.style_prompt}
 
 Rules:
-- Only return the translated text, nothing else
-- Do not add quotes or explanations
-- Keep any placeholders like {{name}}, {{count}}, %s, %d, {{0}}, etc. unchanged
-- Sound natural, not robotic or machine-translated
+- Return ONLY the translations in the exact same format: [number] translated text
+- Keep placeholders like {{name}}, {{count}}, %s, %d, {{0}} unchanged
+- Sound natural, not robotic
 
-Text to translate:
-{text}"""
+Texts:
+{texts}"""
 
-    system_prompt = f"""You are a native {target_lang} speaker and professional translator.
-Translate naturally from {source_lang} to {target_lang}.
-Style: {style_instruction}
-The translation should sound like it was originally written in {target_lang}, not translated.
-Preserve all formatting, placeholders, and special characters."""
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.5,
-        "max_tokens": 2048
-    }
-    
-    try:
-        resp = requests.post(LM_STUDIO_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        result = resp.json()
-        return result["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERROR] API request failed: {e}")
-        raise  # Re-raise to handle in caller
-
-def count_strings(value: Any) -> int:
-    """Count total translatable strings in a structure."""
-    if isinstance(value, str):
-        return 1 if value.strip() else 0
-    elif isinstance(value, dict):
-        return sum(count_strings(v) for v in value.values())
-    elif isinstance(value, list):
-        return sum(count_strings(item) for item in value)
-    return 0
-
-def translate_value(value: Any, source_lang: str, target_lang: str, model: str, 
-                    state: TranslationState, job_id: str, style: str = "friendly",
-                    path: str = "", stats: dict = None) -> Any:
-    """Recursively translate values in a nested structure with resume support."""
-    if stats is None:
-        stats = {"done": 0, "skipped": 0, "total": 0}
-    
-    if isinstance(value, str):
-        if not value.strip():
-            return value
+    def _parse_batch_response(self, response: str, count: int) -> list[str]:
+        """Parse batch response into individual translations."""
+        results = [""] * count
+        pattern = r'\[(\d+)\]\s*(.+?)(?=\[\d+\]|$)'
+        matches = re.findall(pattern, response, re.DOTALL)
         
-        # Check if already translated
-        cached = state.get_translated(job_id, path)
-        if cached and cached.get("original") == value:
-            stats["skipped"] += 1
-            print(f"  [SKIP] {path} (already translated)")
-            return cached["translated"]
+        for idx_str, text in matches:
+            idx = int(idx_str)
+            if 0 <= idx < count:
+                results[idx] = text.strip()
         
-        stats["done"] += 1
-        print(f"  [{stats['done']}/{stats['total']}] Translating: {path}")
+        return results
+    
+    def translate_single(self, text: str) -> str:
+        """Translate a single text."""
+        if not text or not text.strip():
+            return text
+        
+        # Check cache first
+        cached = self.cache.get(text, self.source_lang, self.target_lang, self.style)
+        if cached:
+            return cached
+        
+        prompt = f"""Translate from {self.source_lang} to {self.target_lang}.
+Style: {self.style_prompt}
+Keep placeholders unchanged. Return only the translation.
+
+Text: {text}"""
+        
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": f"You are a native {self.target_lang} translator."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 2048
+        }
         
         try:
-            translated = translate_text(value, source_lang, target_lang, model, style)
-            state.mark_done(job_id, path, value, translated)
-            time.sleep(0.1)
-            return translated
+            import requests
+            resp = requests.post(self.url, json=payload, timeout=120)
+            resp.raise_for_status()
+            result = resp.json()["choices"][0]["message"]["content"].strip()
+            self.cache.set(text, self.source_lang, self.target_lang, self.style, result)
+            return result
         except Exception as e:
-            print(f"  [ERROR] Failed at {path}, saving progress...")
-            raise
+            print(f"Translation error: {e}")
+            return text
     
-    elif isinstance(value, dict):
-        result = {}
-        for k, v in value.items():
-            new_path = f"{path}.{k}" if path else k
-            result[k] = translate_value(v, source_lang, target_lang, model, state, job_id, style, new_path, stats)
-        return result
+    def translate_batch(self, items: list[tuple[str, str]]) -> dict[str, str]:
+        """Translate a batch of items."""
+        results = {}
+        to_translate = []
+        
+        # Check cache for all items first
+        for key, text in items:
+            cached = self.cache.get(text, self.source_lang, self.target_lang, self.style)
+            if cached:
+                results[key] = cached
+            else:
+                to_translate.append((key, text))
+        
+        if not to_translate:
+            return results
+        
+        # Batch translate remaining
+        prompt = self._build_batch_prompt(to_translate)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": f"You are a native {self.target_lang} translator."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096
+        }
+        
+        try:
+            import requests
+            resp = requests.post(self.url, json=payload, timeout=180)
+            resp.raise_for_status()
+            response_text = resp.json()["choices"][0]["message"]["content"]
+            translations = self._parse_batch_response(response_text, len(to_translate))
+            
+            for (key, original), translated in zip(to_translate, translations):
+                if translated:
+                    results[key] = translated
+                    self.cache.set(original, self.source_lang, self.target_lang, self.style, translated)
+                else:
+                    results[key] = original
+        except Exception as e:
+            print(f"Batch translation error: {e}")
+            # Fallback to single translation
+            for key, text in to_translate:
+                results[key] = self.translate_single(text)
+        
+        return results
     
-    elif isinstance(value, list):
-        result = []
-        for i, item in enumerate(value):
-            new_path = f"{path}[{i}]"
-            result.append(translate_value(item, source_lang, target_lang, model, state, job_id, style, new_path, stats))
-        return result
-    
-    return value
+    def translate_all(self, flat_data: dict[str, str], state: TranslationState, job_id: str,
+                      progress_callback=None) -> dict[str, str]:
+        """Translate all items with parallel batch processing."""
+        global shutdown_requested
+        results = {}
+        items_to_translate = []
+        
+        # Filter out already completed items
+        for key, text in flat_data.items():
+            existing = state.get_translated(job_id, key)
+            if existing:
+                results[key] = existing
+            else:
+                items_to_translate.append((key, text))
+        
+        if not items_to_translate:
+            return results
+        
+        # Split into batches
+        batches = [items_to_translate[i:i+self.batch_size] for i in range(0, len(items_to_translate), self.batch_size)]
+        completed = 0
+        total = len(items_to_translate)
+        
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self.translate_batch, batch): batch for batch in batches}
+            
+            for future in as_completed(futures):
+                if shutdown_requested:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                
+                batch = futures[future]
+                try:
+                    batch_results = future.result(timeout=300)
+                    for key, translation in batch_results.items():
+                        results[key] = translation
+                        original = dict(batch).get(key, "")
+                        state.mark_done(job_id, key, original, translation)
+                    
+                    completed += len(batch)
+                    if progress_callback:
+                        progress_callback(completed, total)
+                    
+                except Exception as e:
+                    print(f"\nBatch failed: {e}")
+                
+                state.save()
+                time.sleep(0.1)
+        
+        return results
 
-def translate_json_file(input_path: str, output_path: str, source_lang: str, 
-                        target_lang: str, model: str, state: TranslationState,
-                        style: str = "friendly", force_restart: bool = False):
-    """Translate an entire i18n JSON file with resume capability."""
-    job_id = state.get_job_id(input_path, target_lang)
-    style_info = TRANSLATION_STYLES.get(style, TRANSLATION_STYLES["friendly"])
+
+# ============== Main Functions ==============
+def translate_file(input_path: str, output_path: str, source_lang: str, target_lang: str,
+                   model: str, style: str, state: TranslationState, cache: TranslationCache,
+                   batch_size: int, max_workers: int, api_url: str, force_restart: bool = False):
+    """Translate a single file."""
+    if shutdown_requested:
+        return
     
-    print(f"\n{'='*60}")
-    print(f"Job ID: {job_id}")
-    print(f"Input: {input_path}")
-    print(f"From: {source_lang} -> To: {target_lang}")
-    print(f"Style: {style_info['name']}")
-    print(f"Output: {output_path}")
+    handler = FileHandler.get_handler(input_path)
+    job_id = state.get_job_id(input_path, target_lang)
     
     if force_restart:
         state.clear_job(job_id)
-        print("Progress cleared - starting fresh")
     
-    existing_progress = state.get_progress(job_id)
-    if existing_progress > 0:
-        print(f"Resuming: {existing_progress} strings already translated")
+    print(f"\n{'='*60}")
+    print(f"📄 File: {input_path}")
+    print(f"🌐 {source_lang} → {target_lang}")
+    print(f"🎨 Style: {TRANSLATION_STYLES.get(style, {}).get('name', style)}")
+    print(f"💾 Output: {output_path}")
     print('='*60)
     
-    with open(input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    flat_data, original_data = handler.load(input_path)
+    total = len(flat_data)
+    print(f"Found {total} translatable strings")
     
-    total_strings = count_strings(data)
-    print(f"Total strings to translate: {total_strings}")
+    engine = TranslationEngine(
+        url=api_url, model=model, style=style,
+        source_lang=source_lang, target_lang=target_lang,
+        cache=cache, batch_size=batch_size, max_workers=max_workers
+    )
     
-    stats = {"done": 0, "skipped": 0, "total": total_strings}
+    if RICH_AVAILABLE:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Translating...", total=total)
+            
+            def update_progress(completed, total):
+                progress.update(task, completed=completed)
+            
+            results = engine.translate_all(flat_data, state, job_id, update_progress)
+    else:
+        def simple_progress(completed, total):
+            print(f"\r  Progress: {completed}/{total} ({100*completed//total}%)", end="", flush=True)
+        
+        results = engine.translate_all(flat_data, state, job_id, simple_progress)
+        print()
     
-    try:
-        translated_data = translate_value(data, source_lang, target_lang, model, state, job_id, style, "", stats)
-        
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(translated_data, f, ensure_ascii=False, indent=2)
-        
-        print(f"\n✓ Translation complete!")
-        print(f"  - Newly translated: {stats['done']}")
-        print(f"  - Skipped (cached): {stats['skipped']}")
-        print(f"  - Output: {output_path}")
-        
-    except KeyboardInterrupt:
-        print(f"\n\n⚠ Interrupted! Progress saved ({stats['done']} strings translated)")
-        print(f"  Run the same command again to resume.")
-        raise
-    except Exception as e:
-        print(f"\n\n⚠ Error occurred! Progress saved ({stats['done']} strings translated)")
-        print(f"  Run the same command again to resume.")
-        raise
+    handler.save(output_path, results, original_data)
+    
+    hits, misses = cache.get_stats()
+    print(f"\n✅ Done! Cache hits: {hits}, API calls: {misses}")
+    cache.save()
 
-def batch_translate(input_dir: str, output_dir: str, source_lang: str, 
-                    target_langs: list[str], model: str, state: TranslationState,
-                    style: str = "friendly", force_restart: bool = False):
-    """Translate all JSON files in a directory (including subdirectories) to multiple target languages."""
+
+def batch_translate(input_dir: str, output_dir: str, source_lang: str, target_langs: list[str],
+                    model: str, style: str, state: TranslationState, cache: TranslationCache,
+                    batch_size: int, max_workers: int, api_url: str, force_restart: bool = False):
+    """Translate all supported files in a directory."""
+    global shutdown_requested
     input_path = Path(input_dir)
+    extensions = ['*.json', '*.yaml', '*.yml', '*.po', '*.pot', '*.csv', '*.xml', '*.strings']
     
-    # Recursive search for all JSON files
-    json_files = list(input_path.rglob("*.json"))
+    all_files = []
+    for ext in extensions:
+        all_files.extend(input_path.rglob(ext))
     
-    if not json_files:
-        print(f"No JSON files found in {input_dir}")
+    if not all_files:
+        print(f"No supported files found in {input_dir}")
         return
     
-    print(f"Found {len(json_files)} JSON file(s)")
-    for f in json_files:
-        print(f"  - {f.relative_to(input_path)}")
+    print(f"Found {len(all_files)} file(s)")
     
-    for json_file in json_files:
-        # Preserve subdirectory structure
-        relative_path = json_file.relative_to(input_path)
-        
+    for file_path in all_files:
+        if shutdown_requested:
+            break
+        relative_path = file_path.relative_to(input_path)
         for target_lang in target_langs:
+            if shutdown_requested:
+                break
             output_file = Path(output_dir) / target_lang / relative_path
-            translate_json_file(str(json_file), str(output_file), source_lang, 
-                              target_lang, model, state, style, force_restart)
+            try:
+                translate_file(
+                    str(file_path), str(output_file), source_lang, target_lang,
+                    model, style, state, cache, batch_size, max_workers, api_url, force_restart
+                )
+            except Exception as e:
+                print(f"❌ Error processing {file_path}: {e}")
 
-def show_status(state: TranslationState):
-    """Show current translation progress status."""
-    print("\n📊 Translation Progress Status")
-    print("="*60)
-    
-    if not state.state["completed"]:
-        print("No translations in progress.")
-        return
-    
-    for job_id, translations in state.state["completed"].items():
-        print(f"\nJob: {job_id}")
-        print(f"  Completed strings: {len(translations)}")
-        if translations:
-            sample_keys = list(translations.keys())[:3]
-            print(f"  Sample keys: {', '.join(sample_keys)}...")
+
+def show_status(state: TranslationState, cache: TranslationCache):
+    """Show translation status."""
+    if RICH_AVAILABLE:
+        table = Table(title="Translation Status")
+        table.add_column("Job ID")
+        table.add_column("Completed")
+        
+        for job_id, data in state.state.get("completed", {}).items():
+            table.add_row(job_id, str(len(data)))
+        
+        console.print(table)
+        console.print(f"\n📦 Cache entries: {len(cache.cache)}")
+    else:
+        print("\n📊 Translation Status")
+        print("="*40)
+        for job_id, data in state.state.get("completed", {}).items():
+            print(f"  {job_id}: {len(data)} strings")
+        print(f"\n📦 Cache entries: {len(cache.cache)}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate i18n JSON files using LM Studio API")
-    parser.add_argument("input", nargs="?", help="Input JSON file or directory")
-    parser.add_argument("-o", "--output", help="Output file or directory", default="./translated")
-    parser.add_argument("-s", "--source", help="Source language", default="English")
-    parser.add_argument("-t", "--target", help="Target language(s), comma-separated", default="Persian")
-    parser.add_argument("-m", "--model", help="Model name in LM Studio", default="local-model")
-    parser.add_argument("--url", help="LM Studio API URL", default="http://localhost:1234/v1/chat/completions")
-    parser.add_argument("--state-file", help="State file for resume capability", default="./.translation_state.json")
-    parser.add_argument("--restart", action="store_true", help="Clear progress and start fresh")
-    parser.add_argument("--status", action="store_true", help="Show translation progress status")
-    parser.add_argument("--clear", help="Clear progress for specific job ID or 'all'")
-    parser.add_argument("--style", choices=list(TRANSLATION_STYLES.keys()), default="friendly",
-                        help="Translation style/tone (default: friendly)")
-    parser.add_argument("--list-styles", action="store_true", help="Show available translation styles")
+    parser = argparse.ArgumentParser(description="Translate i18n files using LM Studio API")
+    parser.add_argument("input", nargs="?", help="Input file or directory")
+    parser.add_argument("-o", "--output", default="./translated", help="Output file/directory")
+    parser.add_argument("-s", "--source", default="English", help="Source language")
+    parser.add_argument("-t", "--target", default="German", help="Target language(s), comma-separated")
+    parser.add_argument("-m", "--model", default="local-model", help="LM Studio model name")
+    parser.add_argument("--url", default=LM_STUDIO_URL, help="LM Studio API URL")
+    parser.add_argument("--style", choices=list(TRANSLATION_STYLES.keys()), default="friendly")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Texts per API call")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
+    parser.add_argument("--state-file", default=".translation_state.json")
+    parser.add_argument("--cache-file", default=".translation_cache.json")
+    parser.add_argument("--restart", action="store_true", help="Start fresh")
+    parser.add_argument("--status", action="store_true", help="Show status")
+    parser.add_argument("--clear", help="Clear job ID or 'all'")
+    parser.add_argument("--list-styles", action="store_true")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear translation cache")
     
     args = parser.parse_args()
     
-    global LM_STUDIO_URL
-    LM_STUDIO_URL = args.url
-    
     state = TranslationState(args.state_file)
+    cache = TranslationCache(args.cache_file)
     
-    # Handle list-styles command
     if args.list_styles:
-        print("\n🎨 Available Translation Styles")
-        print("="*60)
+        print("\n🎨 Available Styles:")
         for key, info in TRANSLATION_STYLES.items():
-            print(f"\n  --style {key}")
-            print(f"     {info['name']}")
-            print(f"     {info['example']}")
-        print()
+            print(f"  --style {key:10} {info['name']}")
         return
     
-    # Handle status command
     if args.status:
-        show_status(state)
+        show_status(state, cache)
         return
     
-    # Handle clear command
+    if args.clear_cache:
+        Path(args.cache_file).unlink(missing_ok=True)
+        print("✅ Cache cleared")
+        return
+    
     if args.clear:
         if args.clear == "all":
             state.state["completed"] = {}
             state.save()
-            print("✓ All progress cleared")
         else:
             state.clear_job(args.clear)
-            print(f"✓ Progress cleared for job: {args.clear}")
+        print(f"✅ Cleared: {args.clear}")
         return
     
     if not args.input:
         parser.print_help()
         return
     
-    target_langs = [lang.strip() for lang in args.target.split(",")]
+    target_langs = [l.strip() for l in args.target.split(",")]
     input_path = Path(args.input)
     
     try:
         if input_path.is_file():
-            if len(target_langs) == 1:
-                output = args.output if args.output.endswith('.json') else f"{args.output}/{target_langs[0]}/{input_path.name}"
-                translate_json_file(args.input, output, args.source, target_langs[0], 
-                                  args.model, state, args.style, args.restart)
-            else:
-                for target in target_langs:
+            for target in target_langs:
+                if shutdown_requested:
+                    break
+                if len(target_langs) == 1 and args.output.endswith(input_path.suffix):
+                    output = args.output
+                else:
                     output = f"{args.output}/{target}/{input_path.name}"
-                    translate_json_file(args.input, output, args.source, target, 
-                                      args.model, state, args.style, args.restart)
+                translate_file(args.input, output, args.source, target, args.model,
+                             args.style, state, cache, args.batch_size, args.workers, args.url, args.restart)
         elif input_path.is_dir():
-            batch_translate(args.input, args.output, args.source, target_langs, 
-                          args.model, state, args.style, args.restart)
+            batch_translate(args.input, args.output, args.source, target_langs, args.model,
+                          args.style, state, cache, args.batch_size, args.workers, args.url, args.restart)
         else:
-            print(f"Error: {args.input} not found")
-            exit(1)
+            print(f"❌ Not found: {args.input}")
     except KeyboardInterrupt:
-        print("\nExiting... Progress has been saved.")
-        exit(0)
+        pass
+    finally:
+        if shutdown_requested:
+            print("\n✅ Progress saved. Run again to resume.")
+        state.save()
+        cache.save()
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

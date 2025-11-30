@@ -1,0 +1,8 @@
+# Required
+requests>=2.28.0
+
+# Optional - Better progress bar UI
+rich>=13.0.0
+
+# Optional - YAML file support
+pyyaml>=6.0
