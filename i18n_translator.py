@@ -11,25 +11,16 @@ import time
 import hashlib
 import re
 import csv
-import signal
 import sys
+import os
 from pathlib import Path
 from typing import Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+import threading
 
 # Global flag for graceful shutdown
-shutdown_requested = False
-
-def signal_handler(signum, frame):
-    global shutdown_requested
-    shutdown_requested = True
-    print("\n\n⚠️ Shutdown requested, finishing current batch...")
-
-signal.signal(signal.SIGINT, signal_handler)
-if sys.platform != 'win32':
-    signal.signal(signal.SIGTERM, signal_handler)
+shutdown_event = threading.Event()
 
 # Optional imports with fallbacks
 try:
@@ -49,7 +40,6 @@ except ImportError:
 # Configuration
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 DEFAULT_BATCH_SIZE = 5
-DEFAULT_WORKERS = 3
 
 # Translation style presets
 TRANSLATION_STYLES = {
@@ -445,10 +435,10 @@ class IosStringsHandler(FileHandler):
 
 # ============== Translation Engine ==============
 class TranslationEngine:
-    """Handles translation with batching and parallel processing."""
+    """Handles translation with batching."""
     
     def __init__(self, url: str, model: str, style: str, source_lang: str, target_lang: str,
-                 cache: TranslationCache, batch_size: int = 5, max_workers: int = 3):
+                 cache: TranslationCache, batch_size: int = 5):
         self.url = url
         self.model = model
         self.style = style
@@ -456,7 +446,6 @@ class TranslationEngine:
         self.target_lang = target_lang
         self.cache = cache
         self.batch_size = batch_size
-        self.max_workers = max_workers
         self.style_prompt = TRANSLATION_STYLES.get(style, TRANSLATION_STYLES["friendly"])["prompt"]
     
     def _build_batch_prompt(self, items: list[tuple[str, str]]) -> str:
@@ -489,7 +478,7 @@ Texts:
     
     def translate_single(self, text: str) -> str:
         """Translate a single text."""
-        if not text or not text.strip():
+        if not text or not text.strip() or shutdown_event.is_set():
             return text
         
         # Check cache first
@@ -515,17 +504,21 @@ Text: {text}"""
         
         try:
             import requests
-            resp = requests.post(self.url, json=payload, timeout=120)
+            resp = requests.post(self.url, json=payload, timeout=60)
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"].strip()
             self.cache.set(text, self.source_lang, self.target_lang, self.style, result)
             return result
         except Exception as e:
-            print(f"Translation error: {e}")
+            if not shutdown_event.is_set():
+                print(f"Translation error: {e}")
             return text
     
     def translate_batch(self, items: list[tuple[str, str]]) -> dict[str, str]:
         """Translate a batch of items."""
+        if shutdown_event.is_set():
+            return {}
+            
         results = {}
         to_translate = []
         
@@ -537,7 +530,7 @@ Text: {text}"""
             else:
                 to_translate.append((key, text))
         
-        if not to_translate:
+        if not to_translate or shutdown_event.is_set():
             return results
         
         # Batch translate remaining
@@ -554,7 +547,7 @@ Text: {text}"""
         
         try:
             import requests
-            resp = requests.post(self.url, json=payload, timeout=180)
+            resp = requests.post(self.url, json=payload, timeout=60)
             resp.raise_for_status()
             response_text = resp.json()["choices"][0]["message"]["content"]
             translations = self._parse_batch_response(response_text, len(to_translate))
@@ -566,17 +559,19 @@ Text: {text}"""
                 else:
                     results[key] = original
         except Exception as e:
-            print(f"Batch translation error: {e}")
+            if not shutdown_event.is_set():
+                print(f"\nBatch translation error: {e}")
             # Fallback to single translation
             for key, text in to_translate:
+                if shutdown_event.is_set():
+                    break
                 results[key] = self.translate_single(text)
         
         return results
     
     def translate_all(self, flat_data: dict[str, str], state: TranslationState, job_id: str,
                       progress_callback=None) -> dict[str, str]:
-        """Translate all items with parallel batch processing."""
-        global shutdown_requested
+        """Translate all items with batch processing."""
         results = {}
         items_to_translate = []
         
@@ -596,32 +591,32 @@ Text: {text}"""
         completed = 0
         total = len(items_to_translate)
         
-        # Process batches in parallel
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self.translate_batch, batch): batch for batch in batches}
+        # Process batches sequentially (more reliable for Ctrl+C)
+        for batch in batches:
+            if shutdown_event.is_set():
+                break
             
-            for future in as_completed(futures):
-                if shutdown_requested:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
+            try:
+                batch_results = self.translate_batch(batch)
+                for key, translation in batch_results.items():
+                    results[key] = translation
+                    original = dict(batch).get(key, "")
+                    state.mark_done(job_id, key, original, translation)
                 
-                batch = futures[future]
-                try:
-                    batch_results = future.result(timeout=300)
-                    for key, translation in batch_results.items():
-                        results[key] = translation
-                        original = dict(batch).get(key, "")
-                        state.mark_done(job_id, key, original, translation)
-                    
-                    completed += len(batch)
-                    if progress_callback:
-                        progress_callback(completed, total)
-                    
-                except Exception as e:
-                    print(f"\nBatch failed: {e}")
+                completed += len(batch)
+                if progress_callback:
+                    progress_callback(completed, total)
                 
                 state.save()
-                time.sleep(0.1)
+                
+            except KeyboardInterrupt:
+                shutdown_event.set()
+                break
+            except Exception as e:
+                if not shutdown_event.is_set():
+                    print(f"\nBatch failed: {e}")
+            
+            time.sleep(0.05)
         
         return results
 
@@ -629,9 +624,9 @@ Text: {text}"""
 # ============== Main Functions ==============
 def translate_file(input_path: str, output_path: str, source_lang: str, target_lang: str,
                    model: str, style: str, state: TranslationState, cache: TranslationCache,
-                   batch_size: int, max_workers: int, api_url: str, force_restart: bool = False):
+                   batch_size: int, api_url: str, force_restart: bool = False):
     """Translate a single file."""
-    if shutdown_requested:
+    if shutdown_event.is_set():
         return
     
     handler = FileHandler.get_handler(input_path)
@@ -654,43 +649,52 @@ def translate_file(input_path: str, output_path: str, source_lang: str, target_l
     engine = TranslationEngine(
         url=api_url, model=model, style=style,
         source_lang=source_lang, target_lang=target_lang,
-        cache=cache, batch_size=batch_size, max_workers=max_workers
+        cache=cache, batch_size=batch_size
     )
     
     if RICH_AVAILABLE:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Translating...", total=total)
-            
-            def update_progress(completed, total):
-                progress.update(task, completed=completed)
-            
-            results = engine.translate_all(flat_data, state, job_id, update_progress)
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("Translating...", total=total)
+                
+                def update_progress(completed, total):
+                    progress.update(task, completed=completed)
+                
+                results = engine.translate_all(flat_data, state, job_id, update_progress)
+        except KeyboardInterrupt:
+            shutdown_event.set()
+            results = {k: state.get_translated(job_id, k) or v for k, v in flat_data.items()}
     else:
         def simple_progress(completed, total):
-            print(f"\r  Progress: {completed}/{total} ({100*completed//total}%)", end="", flush=True)
+            pct = 100 * completed // total if total > 0 else 0
+            print(f"\r  Progress: {completed}/{total} ({pct}%)", end="", flush=True)
         
         results = engine.translate_all(flat_data, state, job_id, simple_progress)
         print()
     
-    handler.save(output_path, results, original_data)
+    if results and not shutdown_event.is_set():
+        handler.save(output_path, results, original_data)
+        hits, misses = cache.get_stats()
+        print(f"\n✅ Done! Cache hits: {hits}, API calls: {misses}")
+    elif results:
+        # Partial save on shutdown
+        handler.save(output_path, results, original_data)
+        print(f"\n⚠️ Partial save completed")
     
-    hits, misses = cache.get_stats()
-    print(f"\n✅ Done! Cache hits: {hits}, API calls: {misses}")
     cache.save()
 
 
 def batch_translate(input_dir: str, output_dir: str, source_lang: str, target_langs: list[str],
                     model: str, style: str, state: TranslationState, cache: TranslationCache,
-                    batch_size: int, max_workers: int, api_url: str, force_restart: bool = False):
+                    batch_size: int, api_url: str, force_restart: bool = False):
     """Translate all supported files in a directory."""
-    global shutdown_requested
     input_path = Path(input_dir)
     extensions = ['*.json', '*.yaml', '*.yml', '*.po', '*.pot', '*.csv', '*.xml', '*.strings']
     
@@ -705,17 +709,17 @@ def batch_translate(input_dir: str, output_dir: str, source_lang: str, target_la
     print(f"Found {len(all_files)} file(s)")
     
     for file_path in all_files:
-        if shutdown_requested:
+        if shutdown_event.is_set():
             break
         relative_path = file_path.relative_to(input_path)
         for target_lang in target_langs:
-            if shutdown_requested:
+            if shutdown_event.is_set():
                 break
             output_file = Path(output_dir) / target_lang / relative_path
             try:
                 translate_file(
                     str(file_path), str(output_file), source_lang, target_lang,
-                    model, style, state, cache, batch_size, max_workers, api_url, force_restart
+                    model, style, state, cache, batch_size, api_url, force_restart
                 )
             except Exception as e:
                 print(f"❌ Error processing {file_path}: {e}")
@@ -751,7 +755,6 @@ def main():
     parser.add_argument("--url", default=LM_STUDIO_URL, help="LM Studio API URL")
     parser.add_argument("--style", choices=list(TRANSLATION_STYLES.keys()), default="friendly")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Texts per API call")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     parser.add_argument("--state-file", default=".translation_state.json")
     parser.add_argument("--cache-file", default=".translation_cache.json")
     parser.add_argument("--restart", action="store_true", help="Start fresh")
@@ -799,27 +802,27 @@ def main():
     try:
         if input_path.is_file():
             for target in target_langs:
-                if shutdown_requested:
+                if shutdown_event.is_set():
                     break
                 if len(target_langs) == 1 and args.output.endswith(input_path.suffix):
                     output = args.output
                 else:
                     output = f"{args.output}/{target}/{input_path.name}"
                 translate_file(args.input, output, args.source, target, args.model,
-                             args.style, state, cache, args.batch_size, args.workers, args.url, args.restart)
+                             args.style, state, cache, args.batch_size, args.url, args.restart)
         elif input_path.is_dir():
             batch_translate(args.input, args.output, args.source, target_langs, args.model,
-                          args.style, state, cache, args.batch_size, args.workers, args.url, args.restart)
+                          args.style, state, cache, args.batch_size, args.url, args.restart)
         else:
             print(f"❌ Not found: {args.input}")
     except KeyboardInterrupt:
-        pass
+        shutdown_event.set()
+        print("\n\n⚠️ Interrupted!")
     finally:
-        if shutdown_requested:
-            print("\n✅ Progress saved. Run again to resume.")
+        if shutdown_event.is_set():
+            print("✅ Progress saved. Run again to resume.")
         state.save()
         cache.save()
-        sys.exit(0)
 
 if __name__ == "__main__":
     main()
